@@ -24,7 +24,7 @@ def load_logo_base64() -> str:
     return base64.b64encode(LOGO_PATH.read_bytes()).decode("utf-8")
 
 
-def post_image(base_url: str, endpoint: str, uploaded_file):
+def post_image(base_url: str, endpoint: str, uploaded_file, data=None):
     uploaded_file.seek(0)
     files = {
         "image": (
@@ -36,11 +36,12 @@ def post_image(base_url: str, endpoint: str, uploaded_file):
     return requests.post(
         f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}",
         files=files,
+        data=data,
         timeout=TIMEOUT_SECONDS,
     )
 
 
-def post_named_images(base_url: str, endpoint: str, uploaded_files: dict[str, object]):
+def post_named_images(base_url: str, endpoint: str, uploaded_files: dict[str, object], data: dict = None):
     files = {}
     for field_name, uploaded_file in uploaded_files.items():
         uploaded_file.seek(0)
@@ -52,6 +53,7 @@ def post_named_images(base_url: str, endpoint: str, uploaded_files: dict[str, ob
     return requests.post(
         f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}",
         files=files,
+        data=data,
         timeout=TIMEOUT_SECONDS,
     )
 
@@ -896,6 +898,12 @@ def render_readiness_tab(base_url: str):
             key="readiness_upload",
             label_visibility="collapsed",
         )
+        validate_liveness = st.checkbox(
+            "Enforce Liveness Validation",
+            value=False,
+            key="readiness_validate_liveness",
+            help="If enabled, a spoof/fake detection caps the readiness score to a maximum of 30."
+        )
         if uploaded is not None:
             st.markdown("<div class='result-frame'>", unsafe_allow_html=True)
             st.image(uploaded, caption="Uploaded fingerprint image", use_container_width=True)
@@ -924,7 +932,8 @@ def render_readiness_tab(base_url: str):
 
         with st.spinner("Submitting image to /readiness..."):
             try:
-                response = post_image(base_url, "/readiness", uploaded)
+                data = {"validate_liveness": "true" if validate_liveness else "false"}
+                response = post_image(base_url, "/readiness", uploaded, data=data)
             except requests.RequestException as exc:
                 st.error(f"Could not reach /readiness: {exc}")
                 st.markdown("</div>", unsafe_allow_html=True)
@@ -943,8 +952,11 @@ def render_readiness_tab(base_url: str):
         except (TypeError, ValueError):
             score_value = None
 
+        is_live = payload.get("is_live")
+        liveness_conf = payload.get("liveness_confidence")
+
         grade_fg, grade_bg = grade_colors(grade)
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
             metric_card("Readiness", f"{score_value:.1f}" if score_value is not None else "N/A", "0 to 100 scale")
         with col2:
@@ -962,6 +974,29 @@ def render_readiness_tab(base_url: str):
             )
         with col3:
             metric_card("Metrics", str(len(breakdown) if isinstance(breakdown, dict) else 0), "Breakdown items")
+        with col4:
+            if is_live is not None:
+                live_text = "Live" if is_live else "Spoof"
+                live_fg, live_bg = ("#1e6f45", "#e7f6ed") if is_live else ("#b33a33", "#fdecea")
+                st.markdown(
+                    f"""
+                    <div class="metric-card">
+                        <div class="metric-label">Liveness</div>
+                        <div style="margin-top:0.75rem;">
+                            <span class="grade-chip" style="color:{live_fg}; background:{live_bg};">{live_text}</span>
+                        </div>
+                        <div class="metric-hint">Liveness check status</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            else:
+                metric_card("Liveness", "N/A", "Liveness check status")
+        with col5:
+            if liveness_conf is not None:
+                metric_card("Liveness Conf", f"{liveness_conf*100:.1f}%", "Confidence probability")
+            else:
+                metric_card("Liveness Conf", "N/A", "Confidence probability")
 
         if score_value is not None:
             st.progress(min(max(score_value / 100.0, 0.0), 1.0), text=f"Overall readiness: {score_value:.1f}/100")
@@ -1010,6 +1045,7 @@ def render_comparison_tab(base_url: str):
                     st.markdown("<div class='result-frame'>", unsafe_allow_html=True)
                     st.image(contactless, caption="Contactless", use_container_width=True)
                     st.markdown("</div>", unsafe_allow_html=True)
+        high_sec = st.checkbox("Enforce UIDAI High-Security Mode (Matches >= 12, Score >= 25%)", value=False, key="high_sec_compare")
         run = st.button("Run comparison", key="run_comparison")
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1038,6 +1074,7 @@ def render_comparison_tab(base_url: str):
                     base_url,
                     "/compare_contact",
                     {"contact": contact, "contactless": contactless},
+                    data={"high_security": "true" if high_sec else "false"}
                 )
             except requests.RequestException as exc:
                 st.error(f"Could not reach /compare_contact: {exc}")
@@ -1055,31 +1092,69 @@ def render_comparison_tab(base_url: str):
         sift_val = comparison.get("sift_matches")
         sift_str = "N/A" if sift_val is None else str(sift_val)
         backend_score = comparison.get("similarity_score", 0.0)
+        
+        contact_minutiae = comparison.get("contact_minutiae_count", "N/A")
+        contactless_minutiae = comparison.get("contactless_minutiae_count", "N/A")
+        matched_minutiae = comparison.get("matched_minutiae_count", 0)
+        verdict = comparison.get("verdict", "FAIL")
+        high_sec_mode_active = comparison.get("high_security_mode", False)
 
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            metric_card("SSIM", f"{ssim_val:.4f}", "Structural similarity")
+            metric_card("Verdict", verdict, "Match verdict status", "success" if verdict == "PASS" else "danger")
         with col2:
-            metric_card("ORB", str(orb_val), "Local matches")
+            metric_card("Matched Minutiae", str(matched_minutiae), "Matching minutiae count")
         with col3:
-            metric_card("SIFT", sift_str, "Local matches")
+            metric_card("Minutiae Counts", f"{contact_minutiae} / {contactless_minutiae}", "Contact / Contactless count")
         with col4:
-            metric_card("Backend", str(backend_score), "Similarity score")
+            metric_card("Match Score", f"{backend_score:.1f}%", "MCC template similarity")
+
+
+
+        with st.expander("Show Image-Level Similarity Metrics (SSIM, ORB, SIFT)"):
+            col_s1, col_s2, col_s3 = st.columns(3)
+            with col_s1:
+                metric_card("SSIM", f"{ssim_val:.4f}", "Structural similarity")
+            with col_s2:
+                metric_card("ORB Matches", str(orb_val), "Local keypoint matches")
+            with col_s3:
+                metric_card("SIFT Matches", sift_str, "Local keypoint matches")
 
         render_pipeline_breakdown(payload.get("pipeline_metrics"))
 
-        chart_col, data_col = st.columns([1.05, 1], gap="large")
+        chart_col, data_col = st.columns([1.3, 0.95], gap="large")
         with chart_col:
+            st.markdown("#### Minutiae Matching Alignment")
+            images = payload.get("images", {})
+            vis_b64 = images.get("comparison_visualization")
+            if vis_b64:
+                vis_img = decode_base64_image(vis_b64)
+                if vis_img is not None:
+                    st.markdown("<div class='result-frame'>", unsafe_allow_html=True)
+                    st.image(vis_img, caption="Minutiae Alignment (Left: Contact, Right: Contactless). Green points and connecting lines show matched minutiae pairs; red points show unmatched minutiae.", use_container_width=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+                else:
+                    st.error("Failed to decode minutiae matching visualization.")
+            else:
+                st.info("No matching visualization available in response.")
+            
+            st.markdown(
+                "##### 💡 How to Read the Alignment Map\n"
+                "* **Parallel Green Lines**: Connect matching minutiae pairs. A dense set of parallel lines indicates that the spatial distribution of landmarks is highly consistent across both prints, indicating a high-confidence match.\n"
+                "* **Green Points**: Represent corresponding features (Ridge Endings or Bifurcations) found in both captures.\n"
+                "* **Red Points**: Represent local features that were either obscured, not captured, or not present in the other scan due to resolution/optical bounds."
+            )
+        with data_col:
             st.markdown("#### Metric Summary")
             rows = [
-                {"Metric": "SSIM", "Value": float(ssim_val)},
-                {"Metric": "ORB", "Value": float(orb_val)},
-                {"Metric": "SIFT", "Value": float(sift_val or 0)},
-                {"Metric": "Backend Score", "Value": float(backend_score)},
-                {"Metric": "Backend Matches", "Value": float(comparison.get("matches", 0))},
+                {"Metric": "SSIM (x100)", "Value": float(ssim_val * 100)},
+                {"Metric": "ORB Matches", "Value": float(orb_val)},
+                {"Metric": "SIFT Matches", "Value": float(sift_val or 0)},
+                {"Metric": "Match Score (%)", "Value": float(backend_score)},
+                {"Metric": "Matched Minutiae", "Value": float(matched_minutiae)},
             ]
             st.bar_chart(rows, x="Metric", y="Value", horizontal=True, color="#D98F0F")
-        with data_col:
+            
             st.markdown("#### Response Payload")
             st.json(clean_payload_for_display(payload))
         st.markdown("</div>", unsafe_allow_html=True)

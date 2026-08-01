@@ -3,6 +3,11 @@ backend/*.pt
 backend/*.pth
 backend/*.h5
 backend/*.tflite
+backend/**/*.pt
+backend/**/*.pth
+backend/**/*.h5
+backend/**/*.tflite
+backend/models/
 
 # ── Python ────────────────────────────────────────────────────────────────────
 backend/venv/

@@ -148,6 +148,23 @@ def build_dce_net():
     xr = layers.Conv2D(24, 3, activation="tanh", padding="same")(layers.Concatenate()([c6, c1]))
     return keras.Model(inputs=inp, outputs=xr)
 
+def load_zero_dce_weights(dce_model, weights_path):
+    """Load Zero-DCE weights from legacy Keras .h5 (model_weights/functional/*)."""
+    import h5py
+    with h5py.File(weights_path, "r") as f:
+        func = f["model_weights"]["functional"]
+        loaded = 0
+        for layer in dce_model.layers:
+            if layer.name not in func:
+                continue
+            kernel = func[f"{layer.name}/kernel"][:]
+            bias = func[f"{layer.name}/bias"][:]
+            layer.set_weights([kernel, bias])
+            loaded += 1
+    if loaded != 7:
+        raise ValueError(f"Expected 7 conv layers, loaded {loaded}")
+
+
 class ZeroDCE(keras.Model):
     def __init__(self):
         super().__init__()
@@ -309,8 +326,8 @@ def load_models():
     if os.path.exists(ZERO_DCE_MODEL_PATH):
         try:
             zdce = ZeroDCE()
-            zdce.dce_model(np.zeros((1,256,256,3), dtype=np.float32))
-            zdce.dce_model.load_weights(ZERO_DCE_MODEL_PATH, by_name=True, skip_mismatch=True)
+            zdce.dce_model(np.zeros((1, 256, 256, 3), dtype=np.float32))
+            load_zero_dce_weights(zdce.dce_model, ZERO_DCE_MODEL_PATH)
             global_models["zero_dce"] = zdce
             print("✓ Zero-DCE loaded")
         except Exception as e:
@@ -372,7 +389,15 @@ def _mask_bbox(mask):
 
 
 def check_blur(image_bgr, mask=None):
-    """Laplacian variance blur score. Higher = sharper."""
+    """Laplacian variance blur score. Higher = sharper.
+
+    Threshold calibration:
+      • Blurry / motion-shake fingerprint: Laplacian var ≈ 2–15
+      • Acceptable but soft fingerprint  : Laplacian var ≈ 15–40
+      • Sharp, ridge-clear fingerprint   : Laplacian var ≈ 40–300+
+    Threshold raised from 3.0 → 20.0 so motion-blurred captures
+    taken during the auto-capture race condition are reliably rejected.
+    """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     lap = cv2.Laplacian(gray, cv2.CV_64F)
     if mask is not None and np.any(mask > 0):
@@ -381,7 +406,7 @@ def check_blur(image_bgr, mask=None):
     else:
         score = float(lap.var())
         method = "full_frame"
-    return {"blur_score": round(score, 2), "is_blurry": score < 3.0, "method": method}
+    return {"blur_score": round(score, 2), "is_blurry": score < 20.0, "method": method}
 
 def check_brightness(image_bgr, mask=None):
     """Mean luminance check."""
@@ -556,6 +581,24 @@ def quality_gate(image_bgr, mask=None, profiler=None):
         "brightness": bright,
         "glare":    glare,
     }
+
+
+def run_quality_gate(image_bgr, profiler=None):
+    """Quality gate on finger ROI — same logic as /quality_check (YOLO crop + U²Net mask)."""
+    eval_img, eval_mask, meta = prepare_quality_roi(image_bgr, profiler=profiler)
+    if not meta.get("finger_detected"):
+        return {
+            "passed": False,
+            "issues": ["No finger detected — place finger in view"],
+            "guidance": "No finger detected — place finger in view",
+            "blur": {"blur_score": 0.0, "is_blurry": True, "method": "none"},
+            "brightness": {"brightness": 0.0, "too_dark": True, "too_bright": False, "method": "none"},
+            "glare": {"has_glare": False, "method": "none"},
+            **meta,
+        }
+    result = quality_gate(eval_img, mask=eval_mask, profiler=profiler)
+    result.update(meta)
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1216,40 +1259,124 @@ def health():
         "mediapipe_available":  MEDIAPIPE_AVAILABLE,
     })
 
-# ── Quality check only ────────────────────────────────────────────────────────
+# ── Quality check (fast polling path) ────────────────────────────────────────
+# Designed to be called every ~1–2 s from the Flutter auto-capture loop.
+# Key changes vs original:
+#   • NO U²Net segmentation (was 850 ms on CPU) — Laplacian + brightness run on
+#     the raw YOLO-cropped box; accurate enough for a go/no-go polling decision.
+#   • YOLO runs at imgsz=320 instead of 800 (~3× faster on CPU, still reliable).
+#   • ROI centering info is returned in the same response, eliminating the
+#     separate /check_roi round-trip that the app was firing in parallel.
+#   • No fake hashlib "encryption" loop.
+#   • Image is decoded from bytes directly — no disk write.
+# Target latency on Azure CPU: ~200–250 ms (was ~1150 ms).
 @app.route("/quality_check", methods=["POST"])
 def quality_check():
     try:
-        profiler = PipelineProfiler()
-        t_io = time.perf_counter()
         if "image" not in request.files:
             return jsonify({"success": False, "error": "no image"}), 400
-        f = request.files["image"]
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(UPLOAD_FOLDER, f"{ts}_{f.filename}")
-        f.save(path)
-        img = cv2.imread(path)
+
+        t0 = time.perf_counter()
+
+        # Decode directly from bytes — skip disk write for polling
+        image_bytes = np.frombuffer(request.files["image"].read(), np.uint8)
+        img = cv2.imdecode(image_bytes, cv2.IMREAD_COLOR)
         if img is None:
             return jsonify({"success": False, "error": "Cannot read image"}), 400
-        profiler.record_step("Capture & Image IO", t_io)
 
-        eval_img, eval_mask, quality_meta = prepare_quality_roi(img, profiler=profiler)
-        if not quality_meta.get("finger_detected"):
-            return jsonify({"success": False, "error": "No finger detected"}), 422
+        image_h, image_w = img.shape[:2]
 
-        result = quality_gate(eval_img, mask=eval_mask, profiler=profiler)
-        result.update(quality_meta)
+        # ── Fast YOLO finger detection at low resolution ──────────────────────
+        model = get_finger_detector()
+        results = model(img, save=False, imgsz=320, conf=0.10, verbose=False)
 
-        t_enc = time.perf_counter()
-        import hashlib
-        data_to_encrypt = b"quality_gate_result"
-        for _ in range(1000):
-            hashlib.sha256(data_to_encrypt).hexdigest()
-        profiler.record_step("Encryption + PID Packaging", t_enc)
+        if not results or len(results[0].boxes) == 0:
+            return jsonify({
+                "success": False,
+                "passed": False,
+                "finger_detected": False,
+                "guidance": "No finger detected — place finger in view",
+                "in_roi": False,
+                "offset_x": 0.0,
+                "offset_y": 0.0,
+                "blur":       {"blur_score": 0.0, "is_blurry": True},
+                "brightness": {"brightness": 0.0, "too_dark": True, "too_bright": False},
+                "glare":      {"has_glare": False},
+                "issues":     ["No finger detected — place finger in view"],
+            }), 422
 
-        result["pipeline_metrics"] = profiler.get_metrics()
-        return jsonify({"success": True, **result})
+        boxes = results[0].boxes.xyxy.cpu().numpy()
+        confs = results[0].boxes.conf.cpu().numpy()
+        best  = int(np.argmax(confs))
+        x1, y1, x2, y2 = map(int, boxes[best])
+        x1 = max(0, x1); y1 = max(0, y1)
+        x2 = min(image_w, x2); y2 = min(image_h, y2)
+        det_conf = float(confs[best])
+        cropped  = img[y1:y2, x1:x2]
+
+        # ── ROI centering (bundled — no extra round-trip needed) ──────────────
+        cx = (x1 + x2) * 0.5;  cy = (y1 + y2) * 0.5
+        icx = image_w * 0.5;   icy = image_h * 0.5
+        offset_x = float(cx - icx);  offset_y = float(cy - icy)
+        tol_x = image_w * 0.12;      tol_y = image_h * 0.12
+        in_roi = bool(abs(offset_x) <= tol_x and abs(offset_y) <= tol_y)
+        if in_roi:
+            roi_guidance = "Good - finger centered"
+        elif abs(offset_x) >= abs(offset_y):
+            roi_guidance = "Move right" if offset_x < 0 else "Move left"
+        else:
+            roi_guidance = "Move down" if offset_y < 0 else "Move up"
+
+        # ── Pixel-only quality checks on cropped box (no U²Net) ──────────────
+        # Use the inner 70% of the bounding box so background pixels around
+        # the finger edges don't inflate the Laplacian variance and fake a
+        # "sharp" result. This matches much closer to what run_quality_gate()
+        # measures on U²Net-masked pixels, eliminating the pass-here/fail-enroll
+        # mismatch.
+        h_c, w_c = cropped.shape[:2]
+        mx, my = int(w_c * 0.15), int(h_c * 0.15)
+        inner = cropped[my:h_c - my, mx:w_c - mx] if h_c > 2*my and w_c > 2*mx else cropped
+
+        blur   = check_blur(inner)        # Laplacian variance ~2 ms
+        bright = check_brightness(inner)  # histogram mean     ~1 ms
+
+        # Glare: fast pixel threshold only — skip the YOLO bright-spot model
+        gray_c      = cv2.cvtColor(inner, cv2.COLOR_BGR2GRAY)
+        overexposed = float(np.sum(gray_c > 245)) / max(1, gray_c.size)
+        glare       = {"has_glare": overexposed > 0.04,
+                       "glare_fraction": round(overexposed, 4),
+                       "method": "pixel_fast"}
+
+        issues = []
+        if blur["is_blurry"]:    issues.append("Image is blurry — hold steady")
+        if bright["too_dark"]:   issues.append("Too dark — enable flash")
+        if bright["too_bright"]: issues.append("Too bright — reduce exposure")
+        if glare["has_glare"]:   issues.append("Glare detected — adjust angle")
+
+        passed   = len(issues) == 0
+        guidance = issues[0] if issues else "Good — capture ready"
+
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+
+        return jsonify({
+            "success":        True,
+            "passed":         passed,
+            "finger_detected": True,
+            "detection_conf": round(det_conf, 4),
+            "guidance":       guidance,
+            "issues":         issues,
+            # ROI bundled — app no longer needs a separate /check_roi call
+            "in_roi":         in_roi,
+            "offset_x":       round(offset_x, 2),
+            "offset_y":       round(offset_y, 2),
+            "roi_guidance":   roi_guidance,
+            "blur":           blur,
+            "brightness":     bright,
+            "glare":          glare,
+            "elapsed_ms":     elapsed_ms,
+        })
     except Exception as e:
+        traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
 # ── Check ROI ─────────────────────────────────────────────────────────────────
@@ -1337,9 +1464,9 @@ def enroll():
         path = os.path.join(UPLOAD_FOLDER, f"{ts}_{f.filename}")
         f.save(path)
 
-        # Quality gate
+        # Quality gate on finger ROI (not full frame — avoids false pass on blurry finger)
         raw = cv2.imread(path)
-        qc  = quality_gate(raw)
+        qc  = run_quality_gate(raw)
         if not qc["passed"]:
             return jsonify({"success": False, "quality_failed": True,
                             "guidance": qc["guidance"], "issues": qc["issues"]}), 422
@@ -1402,7 +1529,7 @@ def authenticate():
         f.save(path)
 
         raw = cv2.imread(path)
-        qc  = quality_gate(raw)
+        qc  = run_quality_gate(raw)
         if not qc["passed"]:
             return jsonify({"success": False, "quality_failed": True,
                             "guidance": qc["guidance"], "issues": qc["issues"]}), 422
@@ -1466,7 +1593,7 @@ def verify():
         f.save(path)
 
         raw = cv2.imread(path)
-        qc  = quality_gate(raw)
+        qc  = run_quality_gate(raw)
         if not qc["passed"]:
             return jsonify({"success": False, "quality_failed": True,
                             "guidance": qc["guidance"], "issues": qc["issues"]}), 422
@@ -1511,6 +1638,11 @@ def verify():
 # ── Process (pipeline only, no DB) ───────────────────────────────────────────
 @app.route("/process", methods=["POST"])
 def process():
+    """Pipeline visualizer — uses run_quality_gate() (YOLO-crop + U²Net mask)
+    so quality behaviour is identical to /enroll, /authenticate, /verify.
+    Previously called quality_gate(raw) directly which skipped the crop step
+    and used the full-frame Laplacian, causing blurry images to slip through.
+    """
     try:
         if "image" not in request.files:
             return jsonify({"error": "no image"}), 400
@@ -1519,22 +1651,37 @@ def process():
         path = os.path.join(UPLOAD_FOLDER, f"{ts}_{f.filename}")
         f.save(path)
 
-        raw      = cv2.imread(path)
-        qc       = quality_gate(raw)
+        raw = cv2.imread(path)
+        if raw is None:
+            return jsonify({"success": False, "error": "Cannot read image"}), 400
+
+        # Use run_quality_gate so blur is measured on the cropped finger ROI —
+        # consistent with every other endpoint and much harder to fool with a
+        # blurry full-frame image that happens to have a sharp background.
+        qc = run_quality_gate(raw)
+
+        # Still run the full pipeline so the visualizer always has images to show,
+        # but flag quality status so the app can surface the warning.
         cropped, det_conf = detect_and_crop(path)
         liveness = check_liveness(cropped)
         preprocessed = preprocess_fingerprint(cropped)
         minutiae = detect_minutiae(preprocessed) if "minutiae" in global_models else []
         vis      = create_visualization(preprocessed, minutiae) if minutiae else preprocessed
 
+        # Include the original image in pipeline steps so the visualizer can
+        # display it at step 1.
+        _, orig_buf = cv2.imencode(".png", raw)
+        orig_b64 = base64.b64encode(orig_buf).decode()
+
         return jsonify({
             "success":          True,
             "quality":          qc,
-            "detection_conf":   round(det_conf,4),
+            "detection_conf":   round(det_conf, 4),
             "liveness":         liveness,
             "minutiae_count":   len(minutiae),
             "minutiae":         minutiae,
             "images": {
+                "original":       orig_b64,
                 "cropped":        img_to_b64(cropped),
                 "preprocessed":   img_to_b64(preprocessed),
                 "visualization":  img_to_b64(vis),
@@ -1894,4 +2041,5 @@ if __name__ == "__main__":
     print("  GET  /health          — Health check")
     print("  POST /export_template — Export ISO template")
     print("="*60 + "\n")
-    app.run(host="0.0.0.0", port=5001, debug=False)
+    port = int(os.environ.get("PORT", 5001))
+    app.run(host="0.0.0.0", port=port, debug=False)

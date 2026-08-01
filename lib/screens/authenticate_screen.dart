@@ -5,7 +5,7 @@ import 'package:go_router/go_router.dart';
 import '../theme/app_theme.dart';
 import '../widgets/fingerprint_camera_widget.dart';
 import '../services/api_service.dart';
-import 'screens.dart' show ysShimmer, ysOfflineCard;
+import 'screens.dart' show ysShimmer, ysOfflineCard, regionDropdown;
 
 class AuthenticateScreen extends StatefulWidget {
   const AuthenticateScreen({super.key});
@@ -14,23 +14,20 @@ class AuthenticateScreen extends StatefulWidget {
 }
 
 class _AuthenticateScreenState extends State<AuthenticateScreen> {
-  final _batchCtrl = TextEditingController();
+  String? _region;
   bool _loading = false;
   Map<String, dynamic>? _result;
 
-  @override
-  void dispose() { _batchCtrl.dispose(); super.dispose(); }
-
   Future<void> _authenticate(File image) async {
-    if (_batchCtrl.text.trim().isEmpty) {
+    if (_region == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Enter batch', style: YS.label(13)),
+          SnackBar(content: Text('Select a region', style: YS.label(13)),
               backgroundColor: YS.red));
       return;
     }
     setState(() { _loading = true; _result = null; });
     try {
-      final r = await ApiService.authenticate(batch: _batchCtrl.text.trim(), image: image);
+      final r = await ApiService.authenticate(batch: _region!, image: image);
       setState(() { _result = r; _loading = false; });
       if (r['success'] == true) { HapticFeedback.heavyImpact(); }
       else { HapticFeedback.vibrate(); }
@@ -70,12 +67,9 @@ class _AuthenticateScreenState extends State<AuthenticateScreen> {
             ]),
           ),
           const SizedBox(height: 20),
-          TextField(
-            controller: _batchCtrl,
-            style: YS.label(14),
-            decoration: InputDecoration(
-              labelText: 'Batch / Group', hintText: 'e.g. BATCH_A',
-              prefixIcon: Icon(Icons.group_outlined, color: YS.inkLight, size: 18)),
+          regionDropdown(
+            value: _region,
+            onChanged: (v) => setState(() => _region = v),
           ),
           const SizedBox(height: 24),
           Text('FINGERPRINT CAPTURE', style: YS.label(11, color: YS.inkLight, w: FontWeight.w700)

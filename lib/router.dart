@@ -15,5 +15,6 @@ final appRouter = GoRouter(
     GoRoute(path: '/pipeline',     builder: (context, state) => const PipelineScreen()),
     GoRoute(path: '/history',      builder: (context, state) => const HistoryScreen()),
     GoRoute(path: '/settings',     builder: (context, state) => const SettingsScreen()),
+    GoRoute(path: '/qc',           builder: (context, state) => const QcScreen()),
   ],
 );

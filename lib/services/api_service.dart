@@ -1,18 +1,35 @@
 import 'dart:io';
 import 'package:dio/dio.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class ApiService {
-  static String baseUrl = 'http://10.173.127.161:5001';
+  static const String _defaultUrl = 'http://35.255.138.39:5002';
+  static const String _prefKey    = 'server_url_v2';
+
+  static String baseUrl = _defaultUrl;
 
   static final Dio _dio = Dio(BaseOptions(
-    baseUrl: baseUrl,
+    baseUrl: _defaultUrl,
     connectTimeout: const Duration(seconds: 30),
     receiveTimeout: const Duration(seconds: 90),
   ));
 
-  static void setBaseUrl(String url) {
+  /// Call once at app startup — loads persisted URL from SharedPreferences.
+  static Future<void> init() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(_prefKey);
+    if (saved != null && saved.isNotEmpty) {
+      baseUrl = saved;
+      _dio.options.baseUrl = saved;
+    }
+  }
+
+  /// Updates the in-memory URL and persists it so it survives restarts.
+  static Future<void> setBaseUrl(String url) async {
     baseUrl = url;
     _dio.options.baseUrl = url;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_prefKey, url);
   }
 
   static Future<Map<String, dynamic>> healthCheck() async {

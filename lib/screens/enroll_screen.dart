@@ -5,7 +5,7 @@ import 'package:go_router/go_router.dart';
 import '../theme/app_theme.dart';
 import '../widgets/fingerprint_camera_widget.dart';
 import '../services/api_service.dart';
-import 'screens.dart' show ysShimmer, ysOfflineCard;
+import 'screens.dart' show ysShimmer, ysOfflineCard, regionDropdown;
 import 'gesture_liveness_screen.dart';
 
 class EnrollScreen extends StatefulWidget {
@@ -15,34 +15,37 @@ class EnrollScreen extends StatefulWidget {
 }
 
 class _EnrollScreenState extends State<EnrollScreen> {
-  final _nameCtrl  = TextEditingController();
-  final _uidCtrl   = TextEditingController();
-  final _batchCtrl = TextEditingController();
-  File? _image;
-  bool _loading = false;
+  final _nameCtrl = TextEditingController();
+  final _uidCtrl  = TextEditingController();
+  String? _region;          // selected region (batch)
+  File?   _image;
+  bool    _loading = false;
   Map<String, dynamic>? _result;
   bool _gesturePassed = false;
-  // Gesture liveness is temporarily hidden — set back to true to re-enable.
   static const bool _livenessEnabled = false;
 
   @override
-  void dispose() { _nameCtrl.dispose(); _uidCtrl.dispose(); _batchCtrl.dispose(); super.dispose(); }
+  void dispose() { _nameCtrl.dispose(); _uidCtrl.dispose(); super.dispose(); }
 
   Future<void> _enroll() async {
-    if (_nameCtrl.text.trim().isEmpty || _uidCtrl.text.trim().isEmpty || _batchCtrl.text.trim().isEmpty) {
+    if (_nameCtrl.text.trim().isEmpty || _uidCtrl.text.trim().isEmpty) {
       _snack('Fill all fields'); return;
     }
-    if (_image == null) { _snack('Capture fingerprint first'); return; }
+    if (_region == null) { _snack('Select a region'); return; }
+    if (_image == null)  { _snack('Capture fingerprint first'); return; }
     setState(() { _loading = true; _result = null; });
     try {
       final r = await ApiService.enroll(
-        name: _nameCtrl.text.trim(), uid: _uidCtrl.text.trim(),
-        batch: _batchCtrl.text.trim(), image: _image!);
+        name:  _nameCtrl.text.trim(),
+        uid:   _uidCtrl.text.trim(),
+        batch: _region!,
+        image: _image!,
+      );
       setState(() { _result = r; _loading = false; });
       if (r['success'] == true) {
         HapticFeedback.heavyImpact();
-        _nameCtrl.clear(); _uidCtrl.clear(); _batchCtrl.clear();
-        setState(() { _image = null; _gesturePassed = false; });
+        _nameCtrl.clear(); _uidCtrl.clear();
+        setState(() { _image = null; _region = null; _gesturePassed = false; });
       }
     } catch (e) {
       final isOffline = e.toString().contains('SocketException') ||
@@ -73,49 +76,22 @@ class _EnrollScreenState extends State<EnrollScreen> {
         child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           _badge('FINGERPRINT ENROLLMENT', YS.amber, YS.amberSoft),
           const SizedBox(height: 20),
-          _field(_nameCtrl,  'Full Name',     'e.g. Priya Sharma',   Icons.person_outline_rounded),
+          _field(_nameCtrl, 'Full Name',   'e.g. Priya Sharma',   Icons.person_outline_rounded),
           const SizedBox(height: 12),
-          _field(_uidCtrl,   'Aadhaar UID',   'e.g. 1234-5678-9012', Icons.badge_outlined),
+          _field(_uidCtrl,  'Aadhaar UID', 'e.g. 1234-5678-9012', Icons.badge_outlined),
           const SizedBox(height: 12),
-          _field(_batchCtrl, 'Batch / Group', 'e.g. BATCH_A',        Icons.group_outlined),
+          // ── Region / State dropdown ──────────────────────────────────────
+          regionDropdown(
+            value: _region,
+            onChanged: (v) => setState(() => _region = v),
+          ),
           const SizedBox(height: 24),
-          Text('FINGERPRINT CAPTURE', style: YS.label(11, color: YS.inkLight, w: FontWeight.w700)
-              .copyWith(letterSpacing: 1.8)),
+          Text('FINGERPRINT CAPTURE',
+              style: YS.label(11, color: YS.inkLight, w: FontWeight.w700)
+                  .copyWith(letterSpacing: 1.8)),
           const SizedBox(height: 10),
-          // Step 1 — Gesture liveness gate (hidden while _livenessEnabled is false)
           if (_livenessEnabled && !_gesturePassed)
-            Container(
-              padding: const EdgeInsets.all(18),
-              decoration: BoxDecoration(
-                color: YS.amberSoft, borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: YS.amber.withValues(alpha: 0.4)),
-              ),
-              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                Row(children: [
-                  const Icon(Icons.back_hand_rounded, color: YS.amberDeep, size: 20),
-                  const SizedBox(width: 8),
-                  Text('Liveness Check Required',
-                      style: YS.label(14, color: YS.amberDeep, w: FontWeight.w700)),
-                ]),
-                const SizedBox(height: 6),
-                Text('Complete the finger count challenge before capturing your fingerprint.',
-                    style: YS.label(12, color: YS.amberDeep)),
-                const SizedBox(height: 14),
-                ElevatedButton(
-                  onPressed: () => Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (_) => GestureLivenessScreen(
-                        onResult: (passed) {
-                          Navigator.of(context).pop();
-                          if (passed) setState(() => _gesturePassed = true);
-                        },
-                      ),
-                    ),
-                  ),
-                  child: const Text('Start Liveness Check'),
-                ),
-              ]),
-            )
+            _livenessGate()
           else
             Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
               if (_livenessEnabled) ...[
@@ -140,12 +116,21 @@ class _EnrollScreenState extends State<EnrollScreen> {
                 const SizedBox(height: 10),
               ],
               FingerprintCameraWidget(
-                onImageCaptured: (f) => setState(() { _image = f; _result = null; }),
-                disabled: _loading),
+                onImageCaptured: (f) {
+                  setState(() { _image = f; _result = null; });
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                    content: Text('Fingerprint captured ✓', style: YS.label(13)),
+                    backgroundColor: YS.green,
+                    duration: const Duration(seconds: 2),
+                  ));
+                },
+                disabled: _loading,
+              ),
             ]),
           const SizedBox(height: 20),
           if (_loading) ...[ysShimmer(height: 80), const SizedBox(height: 8)],
-          if (!_loading && _result != null) ...[const SizedBox(height: 4),
+          if (!_loading && _result != null) ...[
+            const SizedBox(height: 4),
             if (_result!['offline'] == true)
               ysOfflineCard(() => setState(() => _result = null))
             else
@@ -165,22 +150,58 @@ class _EnrollScreenState extends State<EnrollScreen> {
     );
   }
 
+  Widget _livenessGate() => Container(
+    padding: const EdgeInsets.all(18),
+    decoration: BoxDecoration(
+      color: YS.amberSoft, borderRadius: BorderRadius.circular(16),
+      border: Border.all(color: YS.amber.withValues(alpha: 0.4)),
+    ),
+    child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Row(children: [
+        const Icon(Icons.back_hand_rounded, color: YS.amberDeep, size: 20),
+        const SizedBox(width: 8),
+        Text('Liveness Check Required',
+            style: YS.label(14, color: YS.amberDeep, w: FontWeight.w700)),
+      ]),
+      const SizedBox(height: 6),
+      Text('Complete the finger count challenge before capturing.',
+          style: YS.label(12, color: YS.amberDeep)),
+      const SizedBox(height: 14),
+      ElevatedButton(
+        onPressed: () => Navigator.of(context).push(MaterialPageRoute(
+          builder: (_) => GestureLivenessScreen(
+            onResult: (passed) {
+              Navigator.of(context).pop();
+              if (passed) setState(() => _gesturePassed = true);
+            },
+          ),
+        )),
+        child: const Text('Start Liveness Check'),
+      ),
+    ]),
+  );
+
   Widget _field(TextEditingController c, String label, String hint, IconData icon) =>
-    TextField(controller: c,
-      style: YS.label(14),
-      decoration: InputDecoration(labelText: label, hintText: hint,
-          prefixIcon: Icon(icon, color: YS.inkLight, size: 18)));
+      TextField(
+        controller: c,
+        style: YS.label(14),
+        decoration: InputDecoration(
+          labelText: label, hintText: hint,
+          prefixIcon: Icon(icon, color: YS.inkLight, size: 18),
+        ),
+      );
 
   Widget _badge(String label, Color color, Color bg) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
     decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(8),
         border: Border.all(color: color.withValues(alpha: 0.3))),
-    child: Text(label, style: YS.label(10, color: color, w: FontWeight.w700)
-        .copyWith(letterSpacing: 1.5)),
+    child: Text(label,
+        style: YS.label(10, color: color, w: FontWeight.w700)
+            .copyWith(letterSpacing: 1.5)),
   );
 
   Widget _resultCard(Map<String, dynamic> r) {
-    final ok = r['success'] == true;
+    final ok    = r['success'] == true;
     final color = ok ? YS.green : YS.red;
     final bg    = ok ? YS.greenBg : YS.redBg;
     String msg  = ok ? 'Enrolled successfully!' : (r['error'] ?? r['guidance'] ?? 'Failed');
@@ -194,17 +215,19 @@ class _EnrollScreenState extends State<EnrollScreen> {
         Row(children: [
           Icon(ok ? Icons.check_circle_rounded : Icons.error_rounded, color: color, size: 18),
           const SizedBox(width: 8),
-          Expanded(child: Text(msg, style: YS.label(13, color: color, w: FontWeight.w600))),
+          Expanded(child: Text(msg,
+              style: YS.label(13, color: color, w: FontWeight.w600))),
         ]),
         if (ok) ...[
           const SizedBox(height: 10),
-          _row('Minutiae', '${r['minutiae_count']}'),
-          _row('Liveness', r['liveness']?['is_live'] == true ? 'Live ✓' : 'Spoof'),
+          _row('Minutiae',  '${r['minutiae_count']}'),
+          _row('Liveness',  r['liveness']?['is_live'] == true ? 'Live ✓' : 'Spoof'),
           _row('Detection', '${((r['detection_conf'] ?? 0) * 100).toStringAsFixed(1)}%'),
         ],
         if (r['issues'] != null && (r['issues'] as List).isNotEmpty) ...[
           const SizedBox(height: 8),
-          ...(r['issues'] as List).map((i) => Text('• $i', style: YS.label(11, color: YS.orange))),
+          ...(r['issues'] as List).map((i) =>
+              Text('• $i', style: YS.label(11, color: YS.orange))),
         ],
       ]),
     );

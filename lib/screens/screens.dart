@@ -7,7 +7,44 @@ import '../theme/app_theme.dart';
 import '../widgets/fingerprint_camera_widget.dart';
 import '../services/api_service.dart';
 
-// ── Shared helpers ────────────────────────────────────────────────────────────
+// ── India regions (States + UTs) — used as "batch" across all screens ────────
+
+const List<String> kIndiaRegions = [
+  // States
+  'Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chhattisgarh',
+  'Goa', 'Gujarat', 'Haryana', 'Himachal Pradesh', 'Jharkhand', 'Karnataka',
+  'Kerala', 'Madhya Pradesh', 'Maharashtra', 'Manipur', 'Meghalaya', 'Mizoram',
+  'Nagaland', 'Odisha', 'Punjab', 'Rajasthan', 'Sikkim', 'Tamil Nadu',
+  'Telangana', 'Tripura', 'Uttar Pradesh', 'Uttarakhand', 'West Bengal',
+  // Union Territories
+  'Andaman & Nicobar Islands', 'Chandigarh',
+  'Dadra & Nagar Haveli and Daman & Diu', 'Delhi', 'Jammu & Kashmir',
+  'Ladakh', 'Lakshadweep', 'Puducherry',
+];
+
+/// Shared region / state dropdown used on Enroll, Authenticate and Verify.
+Widget regionDropdown({
+  required String? value,
+  required ValueChanged<String?> onChanged,
+}) =>
+    DropdownButtonFormField<String>(
+      value: value,
+      decoration: InputDecoration(
+        labelText: 'Region / State',
+        hintText: 'Select state or UT',
+        prefixIcon: const Icon(Icons.location_on_outlined, size: 18),
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+        contentPadding:
+            const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+      ),
+      isExpanded: true,
+      items: kIndiaRegions
+          .map((r) => DropdownMenuItem(value: r, child: Text(r)))
+          .toList(),
+      onChanged: onChanged,
+    );
+
+
 
 Widget ysShimmer({double height = 80, double? width, double radius = 14}) =>
     Shimmer.fromColors(
@@ -58,25 +95,25 @@ class VerifyScreen extends StatefulWidget {
 }
 
 class _VerifyScreenState extends State<VerifyScreen> {
-  final _uidCtrl   = TextEditingController();
-  final _batchCtrl = TextEditingController();
+  final _uidCtrl = TextEditingController();
+  String? _region;
   bool _loading = false;
   Map<String, dynamic>? _result;
 
   @override
-  void dispose() { _uidCtrl.dispose(); _batchCtrl.dispose(); super.dispose(); }
+  void dispose() { _uidCtrl.dispose(); super.dispose(); }
 
   Future<void> _verify(File image) async {
-    if (_uidCtrl.text.trim().isEmpty || _batchCtrl.text.trim().isEmpty) {
+    if (_uidCtrl.text.trim().isEmpty || _region == null) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('Enter UID and batch', style: YS.label(13)),
+          content: Text('Enter UID and select region', style: YS.label(13)),
           backgroundColor: YS.red));
       return;
     }
     setState(() { _loading = true; _result = null; });
     try {
       final r = await ApiService.verify(
-          uid: _uidCtrl.text.trim(), batch: _batchCtrl.text.trim(), image: image);
+          uid: _uidCtrl.text.trim(), batch: _region!, image: image);
       setState(() { _result = r; _loading = false; });
       if (r['matched'] == true) { HapticFeedback.heavyImpact(); }
       else { HapticFeedback.vibrate(); }
@@ -117,9 +154,10 @@ class _VerifyScreenState extends State<VerifyScreen> {
             ]),
           ),
           const SizedBox(height: 20),
-          TextField(controller: _batchCtrl, style: YS.label(14),
-            decoration: InputDecoration(labelText: 'Batch / Group',
-                prefixIcon: Icon(Icons.group_outlined, color: YS.inkLight, size: 18))),
+          regionDropdown(
+            value: _region,
+            onChanged: (v) => setState(() => _region = v),
+          ),
           const SizedBox(height: 12),
           TextField(controller: _uidCtrl, style: YS.label(14),
             decoration: InputDecoration(labelText: 'Aadhaar UID',
@@ -380,7 +418,7 @@ class HistoryScreen extends StatefulWidget {
 }
 
 class _HistoryScreenState extends State<HistoryScreen> {
-  final _batchCtrl = TextEditingController();
+  String? _region;
   List<dynamic> _history = [];
   bool _loading = false;
   bool _offline = false;
@@ -388,7 +426,7 @@ class _HistoryScreenState extends State<HistoryScreen> {
   Future<void> _load() async {
     setState(() { _loading = true; _offline = false; });
     try {
-      final h = await ApiService.getHistory(batch: _batchCtrl.text.trim());
+      final h = await ApiService.getHistory(batch: _region ?? '');
       setState(() { _history = h; _loading = false; });
     } catch (e) {
       final isOffline = e.toString().contains('SocketException') ||
@@ -412,9 +450,10 @@ class _HistoryScreenState extends State<HistoryScreen> {
         padding: const EdgeInsets.all(20),
         child: Column(children: [
           Row(children: [
-            Expanded(child: TextField(controller: _batchCtrl, style: YS.label(14),
-              decoration: InputDecoration(labelText: 'Batch (optional)',
-                  prefixIcon: Icon(Icons.group_outlined, color: YS.inkLight, size: 18)))),
+            Expanded(child: regionDropdown(
+              value: _region,
+              onChanged: (v) => setState(() => _region = v),
+            )),
             const SizedBox(width: 12),
             ElevatedButton(onPressed: _load, child: const Text('Load')),
           ]),
@@ -469,15 +508,18 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  final _urlCtrl = TextEditingController(text: ApiService.baseUrl);
+  late final TextEditingController _urlCtrl =
+      TextEditingController(text: ApiService.baseUrl);
   bool _checking = false;
   Map<String, dynamic>? _health;
 
   Future<void> _save() async {
-    ApiService.setBaseUrl(_urlCtrl.text.trim());
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Text('Saved', style: YS.label(13)),
-        backgroundColor: YS.green));
+    await ApiService.setBaseUrl(_urlCtrl.text.trim());
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Saved', style: YS.label(13)),
+          backgroundColor: YS.green));
+    }
   }
 
   Future<void> _check() async {

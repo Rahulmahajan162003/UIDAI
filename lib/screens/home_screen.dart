@@ -136,6 +136,15 @@ class HomeScreen extends StatelessWidget {
                   )),
                 ]),
                 const SizedBox(height: 12),
+                // Full width QC pipeline tool
+                _WideCard(
+                  icon: Icons.science_rounded,
+                  label: 'QC Pipeline',
+                  sub: 'Quality check & readiness scoring',
+                  color: YS.orange,
+                  onTap: () => context.go('/qc'),
+                ),
+                const SizedBox(height: 12),
                 // Full width history
                 _WideCard(
                   icon: Icons.history_rounded,
