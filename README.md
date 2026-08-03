@@ -46,3 +46,8 @@ Expected model files:
 - `liveness_model_v3.pt`
 - `zero_dce_model.h5`
 - `u2net_320x320_float32.tflite`
+
+## Repo Branches (High Level)
+- `feature/uidai-app` (this branch): original single-finger app
+- `feature/uidai-unified`: unified app (single + slap)
+- `feature/slap-preprocessing`: slap preprocessing snapshot
