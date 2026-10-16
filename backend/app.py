@@ -1794,6 +1794,90 @@ def verify_v2():
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
+# ── UID-keyed single-finger enrol / 1:1 verify ───────────────────────────────
+# Person-centric flow: one 12-char UID per person, shared with the slap server
+# via identity_store (identity.db). Independent of the batch-keyed endpoints above.
+import identity_store as ids
+
+app.register_blueprint(ids.identity_bp)   # /uid/register, GET /uid/<uid>
+ids.init_identity_db()   # module level (idempotent) so gunicorn imports get it too
+
+
+def _uid_probe_minutiae():
+    """Full pipeline for one uploaded finger photo -> (minutiae, extras) or a
+    (None, response) pair to return straight to the client."""
+    if "image" not in request.files:
+        return None, (jsonify({"success": False, "error": "image required"}), 400)
+    f  = request.files["image"]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(UPLOAD_FOLDER, f"{ts}_{f.filename}")
+    f.save(path)
+
+    raw = cv2.imread(path)
+    if raw is None:
+        return None, (jsonify({"success": False, "error": "image could not be decoded"}), 400)
+    qc = run_quality_gate(raw)
+    if not qc["passed"]:
+        return None, (jsonify({"success": False, "quality_failed": True,
+                               "guidance": qc["guidance"], "issues": qc["issues"]}), 422)
+
+    cropped, det_conf = detect_and_crop(path)
+    liveness     = check_liveness(cropped)
+    screen_check = detect_screen_replay(cropped)
+    if not liveness["is_live"] or screen_check["is_screen"]:
+        return None, (jsonify({"success": False, "spoof_detected": True,
+                               "liveness_confidence": liveness["confidence"],
+                               "screen_check": screen_check}), 422)
+
+    minutiae = detect_minutiae(preprocess_fingerprint(cropped))
+    return minutiae, {"detection_conf": round(det_conf, 4), "liveness": liveness}
+
+
+@app.route("/uid/enroll", methods=["POST"])
+@ids.require_api_key
+@ids.handles_identity_errors
+def uid_enroll():
+    try:
+        uid = ids.normalize_uid(request.form.get("uid"))
+        pos = ids.normalize_position("single", request.form.get("finger_position"))
+        minutiae, extra = _uid_probe_minutiae()
+        if minutiae is None:
+            return extra
+        if len(minutiae) < ids.MIN_MINUTIAE:
+            return jsonify({"success": False, "error": "Too few minutiae — retake"}), 422
+        counts = ids.add_samples(uid, "single", [(pos, minutiae)])
+        return jsonify({"success": True, "uid": uid, "finger_position": pos,
+                        "samples_for_finger": counts[pos],
+                        "max_samples": ids.max_samples(),
+                        "minutiae_count": len(minutiae), **extra})
+    except ids.IdentityError:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/uid/verify", methods=["POST"])
+@ids.require_api_key
+@ids.handles_identity_errors
+def uid_verify():
+    try:
+        uid = ids.normalize_uid(request.form.get("uid"))
+        pos = ids.normalize_position("single", request.form.get("finger_position"))
+        ids.enrolled_summary(uid)          # 404 before spending time on the pipeline
+        minutiae, extra = _uid_probe_minutiae()
+        if minutiae is None:
+            return extra
+        result = ids.verify_single(uid, pos, minutiae)
+        return jsonify({"success": True, **result,
+                        "input_minutiae_count": len(minutiae)})
+    except ids.IdentityError:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 # ── Process (pipeline only, no DB) ───────────────────────────────────────────
 @app.route("/process", methods=["POST"])
 def process():
@@ -2275,6 +2359,10 @@ if __name__ == "__main__":
     print("  GET  /health          — Health check")
     print("  POST /export_template — Export ISO 19794-2 minutiae record")
     print("  POST /export_fir      — Export ISO 19794-4 finger image record (FP-06)")
+    print("  POST /uid/register    — Register a 12-char UID")
+    print("  POST /uid/enroll      — Add a finger sample under a UID")
+    print("  POST /uid/verify      — 1:1 verify a finger against a UID")
+    print("  GET  /uid/<uid>       — Enrolled finger counts for a UID")
     print("="*60 + "\n")
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port, debug=False)

@@ -944,6 +944,98 @@ def history_endpoint():
     return jsonify({"history": history})
 
 
+# ── UID-keyed slap enrol / 1:1 verify ────────────────────────────────────────
+# Person-centric flow shared with the single-finger server via identity_store
+# (identity.db): one 12-char UID per person. Independent of the batch-keyed
+# endpoints above.
+import identity_store as ids
+
+app.register_blueprint(ids.identity_bp)   # /uid/register, GET /uid/<uid>
+ids.init_identity_db()
+
+
+def _uid_slap_fingers():
+    """Run the slap pipeline on the uploaded image and apply the spoof gate.
+
+    Returns (fingers, None) with fingers = [{finger_position, minutiae, ...}] for
+    every finger that processed OK and has enough minutiae, or (None, response)."""
+    img = _read_image()
+    if img is None:
+        return None, (jsonify({"success": False, "error": "image required"}), 400)
+    result = process_slap(img, hand_side=request.form.get("hand_side", "right"),
+                          finger_order=_parse_finger_order())
+    if result["finger_count"] == 0:
+        return None, (jsonify({"success": False, "quality_failed": True,
+                               "guidance": "No fingers detected",
+                               "finger_count": 0}), 422)
+    ok = [f for f in result["fingers"] if f.get("ok")]
+    for f in ok:
+        lv = f.get("liveness") or {}
+        sc = f.get("screen_check") or {}
+        if not lv.get("is_live") or sc.get("is_screen"):
+            return None, (jsonify({
+                "success": False, "spoof_detected": True,
+                "finger_position": f.get("finger_position"),
+                "liveness_confidence": lv.get("confidence", 0.0),
+                "screen_check": sc}), 422)
+    usable = [f for f in ok if len(f["minutiae"]) >= ids.MIN_MINUTIAE]
+    skipped = [f["finger_position"] for f in result["fingers"] if f not in usable]
+    if not usable:
+        return None, (jsonify({"success": False, "error": "Too few minutiae — retake",
+                               "skipped_fingers": skipped}), 422)
+    return (usable, skipped), None
+
+
+@app.route("/uid/enroll_slap", methods=["POST"])
+@ids.require_api_key
+@ids.handles_identity_errors
+def uid_enroll_slap():
+    try:
+        uid = ids.normalize_uid(request.form.get("uid"))
+        ids.enrolled_summary(uid)          # 404 before spending time on the pipeline
+        got, resp = _uid_slap_fingers()
+        if resp is not None:
+            return resp
+        usable, skipped = got
+        counts = ids.add_samples(
+            uid, "slap", [(f["finger_position"], f["minutiae"]) for f in usable])
+        return jsonify({
+            "success": True, "uid": uid, "max_samples": ids.max_samples(),
+            "enrolled_fingers": [
+                {"finger_position": p, "samples_for_finger": n,
+                 "minutiae_count": next(len(f["minutiae"]) for f in usable
+                                        if ids.normalize_position("slap", f["finger_position"]) == p)}
+                for p, n in counts.items()],
+            "skipped_fingers": skipped})
+    except ids.IdentityError:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/uid/verify_slap", methods=["POST"])
+@ids.require_api_key
+@ids.handles_identity_errors
+def uid_verify_slap():
+    try:
+        uid = ids.normalize_uid(request.form.get("uid"))
+        ids.enrolled_summary(uid)          # 404 before spending time on the pipeline
+        got, resp = _uid_slap_fingers()
+        if resp is not None:
+            return resp
+        usable, skipped = got
+        result = ids.verify_slap(
+            uid, [{"finger_position": f["finger_position"], "minutiae": f["minutiae"]}
+                  for f in usable])
+        return jsonify({"success": True, **result, "skipped_fingers": skipped})
+    except ids.IdentityError:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 # Module-level, not inside __main__: gunicorn/wsgi.py imports this module as
 # "slap_app:app" rather than executing it directly, so anything gated behind
 # __main__ silently never runs under a production WSGI server. Confirmed the
@@ -963,6 +1055,10 @@ if __name__ == "__main__":
     print("  POST /authenticate_slap — 1:N aggregate matching")
     print("  POST /verify_slap     — 1:1 matching against specific UID")
     print("  GET  /history         — slap auth history")
+    print("  POST /uid/register    — register a 12-char UID")
+    print("  POST /uid/enroll_slap — add slap samples under a UID")
+    print("  POST /uid/verify_slap — 1:1 slap verify against a UID (2 fingers must pass)")
+    print("  GET  /uid/<uid>       — enrolled finger counts")
     print("  GET  /health")
     print("=" * 60)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5010)), debug=False)
