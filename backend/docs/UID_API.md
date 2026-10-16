@@ -43,6 +43,7 @@ Missing or wrong key returns `401`. If the server has no key configured it retur
 3. `GET /uid/{uid}` — see which fingers are enrolled, so the app can tell the user
    which finger to present.
 4. `POST /uid/verify` or `POST /uid/verify_slap`.
+5. Fix mistakes with the delete / rename endpoints below.
 
 ## UID rules
 
@@ -187,6 +188,46 @@ Same fields as `enroll_slap`.
 
 `matched` is true when `fingers_passed >= fingers_required`.
 
+## PATCH /uid/{uid}
+
+Renames the person. Nothing else about a person can be edited; to change a template, delete the
+finger and enrol it again.
+
+| Field | Required | Notes |
+|---|---|---|
+| `name` | yes | non-empty |
+
+`200`: same body as `GET /uid/{uid}`. Errors: `400 bad_request`, `404 uid_not_found`.
+
+## DELETE /uid/{uid}/samples
+
+Deletes **every sample** of one finger, so that finger can be enrolled again from scratch
+(this also frees its 5-sample cap).
+
+Query (or form) parameters: `modality` (`single` or `slap`) and `finger_position`.
+
+Example: `DELETE /uid/AB12CD34EF56/samples?modality=single&finger_position=2`
+
+`200`
+```json
+{ "success": true, "uid": "AB12CD34EF56", "deleted_samples": 3 }
+```
+
+Errors: `404 uid_not_found`, `409 finger_not_enrolled` (nothing to delete), `400 bad_request`.
+
+## DELETE /uid/{uid}?confirm=true
+
+**Permanent.** Deletes the person, all their templates and their verification log. The UID can be
+registered again afterwards. Without `confirm=true` the call is refused with `400`, so a stray
+request cannot wipe someone.
+
+`200`
+```json
+{ "success": true, "uid": "AB12CD34EF56", "deleted_samples": 7 }
+```
+
+Errors: `400 bad_request` (missing confirm), `404 uid_not_found`.
+
 ---
 
 ## Errors
@@ -206,13 +247,27 @@ Error bodies look like:
 | 404 | `uid_not_found` | UID was never registered |
 | 409 | `uid_exists` | UID already registered |
 | 409 | `sample_cap_reached` | finger already has 5 samples (`fingers` and `max_samples` in body) |
-| 409 | `finger_not_enrolled` | single verify: no sample for that finger — enrol it first |
+| 409 | `finger_not_enrolled` | single verify: no sample for that finger — enrol it first; also returned when deleting a finger that has no samples |
 | 409 | `not_enough_enrolled_fingers` | slap verify: UID has fewer than 2 enrolled slap fingers (`enrolled_fingers`, `required` in body) |
 | 422 | — with `quality_failed: true` | photo failed quality check; show `guidance` and retake |
 | 422 | — with `spoof_detected: true` | liveness / screen-replay check failed |
 | 422 | `Too few minutiae — retake` | not enough ridge detail; retake |
 | 503 | `api_key_not_configured` | server misconfiguration; contact the backend team |
 | 500 | `error` string | unexpected server error |
+
+## Deploying on the existing VM (`35.255.138.39`)
+
+The `/uid/*` routes are additive: the old endpoints and databases keep working unchanged.
+
+1. Pull this branch onto the VM.
+2. Set the environment for both servers: `API_KEY=<secret>` (and optionally the `UID_*` variables
+   below). Both servers must see the same `IDENTITY_DB` file; the default does this when both run
+   from the same `backend/` folder.
+3. Restart the servers on :5002 (`app.py`) and :5010 (`slap_app.py`). `identity.db` is created on
+   first start.
+4. Smoke test: register a UID, enrol a finger photo, verify with a second photo of the same finger,
+   then `GET /uid/{uid}`.
+5. Give the frontend team the API key and this document.
 
 ## Notes for the backend / deployment team
 

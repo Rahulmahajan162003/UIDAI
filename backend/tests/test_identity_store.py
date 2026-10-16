@@ -261,3 +261,82 @@ def test_info_endpoint(client):
     body = client.get(f"/uid/{UID.lower()}", headers=H).get_json()
     assert body["enrolled"]["single"] == {"2": 1}
     assert body["max_samples_per_finger"] == 5
+
+
+# ── delete / rename ──────────────────────────────────────────────────────────
+def test_delete_finger_clears_only_that_finger_and_modality():
+    ids.register_person(UID)
+    for _ in range(3):
+        ids.add_samples(UID, "single", [("2", make_template())])
+    ids.add_samples(UID, "single", [("3", make_template())])
+    ids.add_samples(UID, "slap", [("2", make_template())])
+    assert ids.delete_finger(UID, "single", 2) == 3
+    assert ids.enrolled_summary(UID)["enrolled"] == {"single": {"3": 1}, "slap": {"2": 1}}
+
+
+def test_deleted_finger_can_be_enrolled_again_past_the_old_cap():
+    ids.register_person(UID)
+    for _ in range(ids.max_samples()):
+        ids.add_samples(UID, "single", [("2", make_template())])
+    ids.delete_finger(UID, "single", 2)
+    assert ids.add_samples(UID, "single", [("2", make_template())]) == {"2": 1}
+
+
+def test_delete_finger_errors():
+    with pytest.raises(ids.PersonNotFound):
+        ids.delete_finger(UID, "single", 2)
+    ids.register_person(UID)
+    with pytest.raises(ids.FingerNotEnrolled):
+        ids.delete_finger(UID, "single", 2)
+    with pytest.raises(ids.BadRequest):
+        ids.delete_finger(UID, "palm", 2)
+
+
+def test_delete_person_removes_everything_and_frees_the_uid():
+    ids.register_person(UID)
+    base = make_template(seed=1)
+    ids.add_samples(UID, "single", [("2", base)])
+    ids.verify_single(UID, 2, jitter(base))          # writes a verification log row
+    assert ids.delete_person(UID) == 1
+    with pytest.raises(ids.PersonNotFound):
+        ids.enrolled_summary(UID)
+    con = ids._connect()
+    try:
+        assert con.execute("SELECT COUNT(*) FROM person_verifications").fetchone()[0] == 0
+        assert con.execute("SELECT COUNT(*) FROM person_templates").fetchone()[0] == 0
+    finally:
+        con.close()
+    ids.register_person(UID)   # the UID is reusable after a hard delete
+
+
+def test_delete_person_unknown_uid_is_not_found():
+    with pytest.raises(ids.PersonNotFound):
+        ids.delete_person(UID)
+
+
+def test_rename_person():
+    ids.register_person(UID, "Asha")
+    assert ids.rename_person(UID.lower(), "  Asha K ")["name"] == "Asha K"
+    with pytest.raises(ids.BadRequest):
+        ids.rename_person(UID, "  ")
+    with pytest.raises(ids.PersonNotFound):
+        ids.rename_person("ZZZZZZZZZZZZ", "x")
+
+
+def test_delete_and_rename_endpoints(client):
+    ids.register_person(UID, "Asha")
+    ids.add_samples(UID, "single", [("2", make_template())])
+    url = f"/uid/{UID.lower()}"
+    assert client.patch(url, data={"name": "New"}).status_code == 401
+    assert client.patch(url, data={"name": "New"}, headers=H).get_json()["name"] == "New"
+
+    assert client.delete(url + "/samples?modality=single&finger_position=9",
+                         headers=H).status_code == 409
+    r = client.delete(url + "/samples?modality=single&finger_position=2", headers=H)
+    assert r.status_code == 200 and r.get_json()["deleted_samples"] == 1
+
+    assert client.delete(url, headers=H).status_code == 400            # no confirm
+    assert client.delete(url + "?confirm=yes", headers=H).status_code == 400
+    assert client.get(url, headers=H).status_code == 200               # still there
+    assert client.delete(url + "?confirm=true", headers=H).status_code == 200
+    assert client.get(url, headers=H).status_code == 404

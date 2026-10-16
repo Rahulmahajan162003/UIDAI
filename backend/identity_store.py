@@ -225,6 +225,61 @@ def enrolled_summary(uid):
         con.close()
 
 
+def rename_person(uid, name):
+    uid = normalize_uid(uid)
+    name = (name or "").strip()
+    if not name:
+        raise BadRequest("name is required")
+    con = _connect()
+    try:
+        _require_person(con, uid)
+        con.execute("UPDATE persons SET name=? WHERE uid=?", (name, uid))
+        con.commit()
+    finally:
+        con.close()
+    return enrolled_summary(uid)
+
+
+def delete_finger(uid, modality, finger_position):
+    """Remove every sample for one finger. Returns how many were deleted."""
+    if modality not in MODALITIES:
+        raise BadRequest("modality must be 'single' or 'slap'")
+    uid = normalize_uid(uid)
+    pos = normalize_position(modality, finger_position)
+    con = _connect()
+    try:
+        _require_person(con, uid)
+        n = con.execute(
+            "DELETE FROM person_templates WHERE uid=? AND modality=? AND finger_position=?",
+            (uid, modality, pos)).rowcount
+        if n == 0:
+            raise FingerNotEnrolled("no samples for this finger", finger_position=pos)
+        con.commit()
+        return n
+    finally:
+        con.close()
+
+
+def delete_person(uid):
+    """Hard delete: the person, all their templates and their verification log."""
+    uid = normalize_uid(uid)
+    con = _connect()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        _require_person(con, uid)
+        templates = con.execute("DELETE FROM person_templates WHERE uid=?", (uid,)).rowcount
+        con.execute("DELETE FROM person_verifications WHERE uid=?", (uid,))
+        con.execute("DELETE FROM persons WHERE uid=?", (uid,))
+        con.commit()
+        return templates
+    except Exception:
+        if con.in_transaction:
+            con.rollback()
+        raise
+    finally:
+        con.close()
+
+
 # ── enrolment ────────────────────────────────────────────────────────────────
 def add_samples(uid, modality, samples):
     """Add one sample per (finger_position, minutiae) pair, atomically.
@@ -398,6 +453,34 @@ def uid_register():
     person = register_person(request.form.get("uid"), request.form.get("name"))
     return jsonify({"success": True, "uid": person["uid"], "name": person["name"],
                     "created_at": person["created_at"]}), 201
+
+
+@identity_bp.route("/uid/<uid>", methods=["PATCH"])
+@require_api_key
+@handles_identity_errors
+def uid_rename(uid):
+    return jsonify({"success": True, **rename_person(uid, request.form.get("name"))})
+
+
+@identity_bp.route("/uid/<uid>", methods=["DELETE"])
+@require_api_key
+@handles_identity_errors
+def uid_delete(uid):
+    # Guard against stray calls: the caller must explicitly confirm.
+    if request.args.get("confirm", request.form.get("confirm", "")).lower() != "true":
+        raise BadRequest("confirm=true is required to delete a person")
+    removed = delete_person(uid)
+    return jsonify({"success": True, "uid": normalize_uid(uid),
+                    "deleted_samples": removed})
+
+
+@identity_bp.route("/uid/<uid>/samples", methods=["DELETE"])
+@require_api_key
+@handles_identity_errors
+def uid_delete_finger(uid):
+    n = delete_finger(uid, request.args.get("modality", request.form.get("modality", "")),
+                      request.args.get("finger_position", request.form.get("finger_position")))
+    return jsonify({"success": True, "uid": normalize_uid(uid), "deleted_samples": n})
 
 
 @identity_bp.route("/uid/<uid>", methods=["GET"])
